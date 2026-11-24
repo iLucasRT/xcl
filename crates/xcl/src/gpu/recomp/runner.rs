@@ -739,7 +739,7 @@ fn draw_gs_views(
         pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
         let pso: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&pd).map_err(|x| format!("CreateGraphicsPipelineState: {x}"))?;
         let draw = Draw { sgprs: sgprs.to_vec(), scissor: [0, 0, size as i32, size as i32] };
-        draw_indexed_on(dev, &pso, &rs, vertices, stride, indices, &[draw], mem, textures, samplers, size, clear)
+        draw_indexed_on(dev, &pso, &rs, vertices, stride, indices, &[draw], mem, textures, samplers, size, clear, 0)
     }
 }
 
@@ -764,7 +764,7 @@ pub fn draw_on(
 }
 
 /// A texture in D3D12 terms (e.g. decoded from a console T# by `gpu::desc`): SRV at
-/// descriptor heap index 2·i; `data` = the `MipLevels` levels one after the other, each in
+/// descriptor heap index `texture_heap_base()` + 2·i in `draw_on_multi`; `data` = the `MipLevels` levels one after the other, each in
 /// tightly packed rows (`row_bytes` for level 0, its width's share for the smaller ones).
 pub struct ViewTexture {
     pub res: D3D12_RESOURCE_DESC,
@@ -780,12 +780,30 @@ pub struct Draw {
     pub scissor: [i32; 4],
 }
 
-/// Heaps with `textures` (SRV at 2·i) and `samplers` (at j), bound on `list`.
-unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textures: &[ViewTexture], samplers: &[D3D12_SAMPLER_DESC]) -> Result<Vec<windows::core::IUnknown>, String> {
+/// Where the textures of `draw_on_multi` start in the view heap: after the memory windows'
+/// raw views when a PSO built by the backend's hook reads them there (`Options::heap_windows`).
+pub fn texture_heap_base() -> u32 {
+    if super::pso::heap_windows() { super::MEM_HEAP_BASE + 4 } else { 0 }
+}
+
+/// The raw views of `mem` for every window slot (see `dispatch_with`).
+unsafe fn window_views(dev: &ID3D12Device, heap: &ID3D12DescriptorHeap, mem: &ID3D12Resource, mem_bytes: u64) {
+    let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+    for k in 0..4usize {
+        let mut h = heap.GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
+        dev.CreateUnorderedAccessView(mem, None::<&ID3D12Resource>, Some(&raw_window_uav(mem_bytes)), h);
+    }
+}
+
+/// Heaps with `textures` (SRV at `base` + 2·i) and `samplers` (at j), bound on `list`; with
+/// `base` > 0 the memory windows' raw views of `mem` come first.
+unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textures: &[ViewTexture], samplers: &[D3D12_SAMPLER_DESC], mem: &ID3D12Resource, mem_bytes: u64, base: u32) -> Result<Vec<windows::core::IUnknown>, String> {
+    let base = base as usize;
     let heap: ID3D12DescriptorHeap = dev
         .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            NumDescriptors: (2 * textures.len()).max(2) as u32,
+            NumDescriptors: (base + (2 * textures.len()).max(2)) as u32,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             NodeMask: 0,
         })
@@ -805,6 +823,9 @@ unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textu
         dev.CreateSampler(sd, at(&sheap, j, sinc));
     }
     let mut keep: Vec<windows::core::IUnknown> = vec![heap.cast().map_err(e)?, sheap.cast().map_err(e)?];
+    if base != 0 {
+        window_views(dev, &heap, mem, mem_bytes);
+    }
     for (i, t) in textures.iter().enumerate() {
         let levels = t.res.MipLevels.max(1) as usize;
         let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); levels];
@@ -835,7 +856,7 @@ unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textu
             list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         }
         list.ResourceBarrier(&[transition(&r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)]);
-        dev.CreateShaderResourceView(&r, Some(&t.srv), at(&heap, 2 * i, inc));
+        dev.CreateShaderResourceView(&r, Some(&t.srv), at(&heap, base + 2 * i, inc));
         keep.push(r.cast().map_err(e)?);
         keep.push(up.cast().map_err(e)?);
     }
@@ -860,10 +881,11 @@ pub fn draw_on_multi(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_indexed_on(dev, pso, rs, vertices, stride, &[], draws, mem, textures, samplers, size, clear)
+    draw_indexed_on(dev, pso, rs, vertices, stride, &[], draws, mem, textures, samplers, size, clear, texture_heap_base())
 }
 
-/// `draw_on_multi`, the draws indexed when there are `indices` (one index buffer for all).
+/// `draw_on_multi`, the draws indexed when there are `indices` (one index buffer for all);
+/// `base`: where the textures start in the view heap (`texture_heap_base`).
 #[allow(clippy::too_many_arguments)]
 fn draw_indexed_on(
     dev: &ID3D12Device,
@@ -878,6 +900,7 @@ fn draw_indexed_on(
     samplers: &[D3D12_SAMPLER_DESC],
     size: u32,
     clear: [f32; 4],
+    base: u32,
 ) -> Result<Vec<[f32; 4]>, String> {
     unsafe {
         let queue: ID3D12CommandQueue =
@@ -956,7 +979,7 @@ fn draw_indexed_on(
         list.ClearRenderTargetView(rtv, &clear, None);
         list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
         list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 }]);
-        let _bound = if textures.is_empty() && samplers.is_empty() { bind_resources(dev, &list, &[], &[]).map(|_| Vec::new())? } else { bind_views(dev, &list, textures, samplers)? };
+        let _bound = if textures.is_empty() && samplers.is_empty() && base == 0 { bind_resources(dev, &list, &[], &[]).map(|_| Vec::new())? } else { bind_views(dev, &list, textures, samplers, &mem_buf, mem_bytes, base)? };
         list.SetGraphicsRootSignature(rs);
         list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetGraphicsRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
